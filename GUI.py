@@ -2,7 +2,6 @@
 """
 PicoScope + SIOS GUI
 
-- Replaces AM300 with PicoScope 2000 AWG control (CW and hardware sweep).
 - Keeps SIOS LSV 2500 NG serial driver.
 - If picosdk is not installed, a DummyPicoScope is used so you can test the GUI.
 """
@@ -21,7 +20,7 @@ except Exception:  # pragma: no cover
     print("Tkinter is needed.")
     sys.exit(1)
 
-# --- picosdk (optional) ---
+#picosdk
 try:
     from picosdk.ps2000a import ps2000a as ps
     import ctypes
@@ -29,7 +28,7 @@ except Exception:
     ps = None
     ctypes = None
 
-# --- Serial for SIOS (optional) ---
+#Serial for SIOS
 try:
     import serial
     import serial.tools.list_ports as list_ports
@@ -37,10 +36,7 @@ except Exception:
     serial = None
     list_ports = None
 
-
-# --------------------------
 # PicoScope driver(s)
-# --------------------------
 
 class PicoScopeError(RuntimeError):
     pass
@@ -260,7 +256,7 @@ class PicoScope2000:
 
 @dataclass
 class SIOSConfig:
-    port: str = "COM3"
+    port: str = "COM4"
     baudrate: int = 115200
     timeout_s: float = 1.0
 
