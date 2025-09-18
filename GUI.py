@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 #picosdk
 try:
-    from picosdk.ps2000a import ps2000a as ps
+    from picosdk.ps2000 import ps2000 as ps
     import ctypes
 except Exception:
     ps = None
@@ -83,65 +83,49 @@ class DummyPicoScope:
 
 class PicoScope2000:
     """
-    PicoScope 2000 AWG wrapper.
-
-    - Requires picosdk.ps2000a (and Pico drivers).
-    - Uses ps2000aOpenUnit / ps2000aCloseUnit and ps2000aSetSigGenBuiltIn if available.
-
-    NOTE: function names and signatures in picosdk can slightly differ by SDK version.
-    If you get an AttributeError or an unexpected return code, please paste the error so
-    I can adapt the wrapper to your installed PicoSDK version.
+    PicoScope 2000 AWG wrapper using ps2000.dll.
     """
+
     def __init__(self, log):
         if ps is None:
             raise PicoScopeError("picosdk not available. Install picosdk and Pico drivers.")
-        if ctypes is None:
-            raise PicoScopeError("ctypes required but not available.")
-        self.chandle = ctypes.c_int16()
+        self.handle = None
         self.log = log
         self.connected = False
-        # Map waveform names to PicoSDK built-in waveform codes (common mapping)
+        # Map waveform names to PicoSDK built-in waveform codes
         self.waveforms = {
             "SIN": 0,
             "SQU": 1,
             "TRI": 2,
             "DC": 3
         }
-        # store last configured params
         self._last_cfg = None
 
     def connect(self):
-        status = ps.ps2000aOpenUnit(ctypes.byref(self.chandle), None)
-        if status != 0:
-            raise PicoScopeError(f"Failed to open PicoScope (status {status})")
+        self.handle = ps.ps2000_open_unit()
+        self.log(f"DEBUG: ps2000_open_unit returned {self.handle}")
+        if self.handle <= 0:
+            raise PicoScopeError(f"Failed to open PicoScope (handle={self.handle})")
         self.connected = True
-        self.log("PicoScope connected (ps2000aOpenUnit returned OK).")
+        self.log("PicoScope connected.")
 
     def close(self):
         if self.connected:
-            status = ps.ps2000aCloseUnit(self.chandle)
-            # some picosdk variants return 0 on success
-            if status != 0:
-                # still try to mark disconnected but log the issue
-                self.log(f"Warning: ps2000aCloseUnit returned status {status}")
-            self.connected = False
+            ps.ps2000_close_unit(self.handle)
             self.log("PicoScope disconnected.")
+            self.connected = False
 
     def set_waveform(self,
                      shape: str = "SIN",
                      f_start: float = 1000.0,
-                     f_stop: Optional[float] = None,
+                     f_stop: float = None,
                      vpp: float = 2.0,
                      offset: float = 0.0,
                      increment: float = 0.0,
                      dwell_time: float = 1.0):
         """
-        Configure built-in AWG.
-
-        If f_stop is provided and > f_start and increment > 0, a hardware sweep is configured.
-        Otherwise a single-frequency CW output is configured.
-
-        This function uses ps2000aSetSigGenBuiltIn if present in the installed picosdk.
+        Configure built-in AWG (CW only for ps2000.dll).
+        Sweep is not supported with this wrapper.
         """
         if not self.connected:
             raise PicoScopeError("PicoScope not connected.")
@@ -149,105 +133,37 @@ class PicoScope2000:
         if shape not in self.waveforms:
             raise ValueError(f"Unsupported waveform: {shape}")
 
-        op = self.waveforms[shape]
-
-        # determine sweep
-        sweep_enabled = False
-        if f_stop is not None and f_stop > f_start and increment > 0.0:
-            sweep_enabled = True
-        else:
-            f_stop = f_start
-            increment = 0.0
-
-        # convert to mV for amplitude/offset as PicoSDK typically expects mV
+        wave = self.waveforms[shape]
         pk_to_pk_mv = int(round(vpp * 1000.0))
         offset_mv = int(round(offset * 1000.0))
 
-        # Check picosdk for the function
-        if not hasattr(ps, "ps2000aSetSigGenBuiltIn"):
-            raise PicoScopeError("ps2000aSetSigGenBuiltIn not available in this picosdk distribution. Check your PicoSDK version.")
-
-        # The call signature can be long; adapt if needed per SDK.
-        # Many SDKs expect:
-        # ps2000aSetSigGenBuiltIn(chandle, offset_mv, pk_to_pk_mv, sweep_type, waveform, startFreq, stopFreq,
-        #                         increment, dwell_time, sweep_enable, shots, sweeps, trigger_type, trigger_src, ext_threshold)
-        sweep_type = 0  # 0 = up; (this can be parameterized if you want)
-        shots = 0       # 0 = continuous
-        sweeps = 0      # 0 = infinite
-
-        status = ps.ps2000aSetSigGenBuiltIn(
-            self.chandle,
-            ctypes.c_int32(offset_mv),
-            ctypes.c_uint32(pk_to_pk_mv),
-            ctypes.c_int32(sweep_type),
-            ctypes.c_int32(op),
-            ctypes.c_double(float(f_start)),
-            ctypes.c_double(float(f_stop)),
-            ctypes.c_double(float(increment)),
-            ctypes.c_double(float(dwell_time)),
-            ctypes.c_int32(1 if sweep_enabled else 0),
-            ctypes.c_uint32(shots),
-            ctypes.c_uint32(sweeps),
-            ctypes.c_int32(0),
-            ctypes.c_int32(0),
-            ctypes.c_int16(0)
+        status = ps.ps2000_set_sig_gen_built_in(
+            self.handle,
+            offset_mv,  # e.g. 0
+            pk_to_pk_mv,  # e.g. 2000 for 2 Vpp
+            wave,  # waveform code
+            ctypes.c_float(f_start),  # start freq
+            ctypes.c_float(f_start),  # stop freq same (no sweep)
+            ctypes.c_float(0.0),  # increment
+            ctypes.c_float(0.0),  # dwell time
+            0,  # sweepType (0 = up)
+            0  # operation (0 = normal)
         )
-
         if status != 0:
-            raise PicoScopeError(f"ps2000aSetSigGenBuiltIn returned status {status} - check SDK docs and parameters.")
+            raise PicoScopeError(f"ps2000_set_sig_gen_built_in returned {status}")
 
-        self._last_cfg = dict(shape=shape, f_start=f_start, f_stop=f_stop, vpp=vpp, offset=offset,
-                              increment=increment, dwell_time=dwell_time, sweep_enabled=sweep_enabled)
-
-        if sweep_enabled:
-            self.log(f"PicoScope HW sweep configured: {shape} {f_start}→{f_stop} Hz step {increment} Hz dwell {dwell_time}s, {vpp} Vpp, offset {offset} V")
-        else:
-            self.log(f"PicoScope CW configured: {shape} {f_start} Hz, {vpp} Vpp, offset {offset} V")
+        self._last_cfg = dict(shape=shape, f_start=f_start, vpp=vpp, offset=offset)
+        self.log(f"PicoScope CW configured: {shape} {f_start} Hz, {vpp} Vpp, offset {offset} V")
 
     def start_output(self):
-        """Start AWG output after configuration.
-
-        Many PicoSDK versions do the output automatically after SetSigGenBuiltIn with shots=0 (continuous).
-        If your SDK requires a separate 'start' call, add it here (e.g. ps2000aSigGenSoftwareControl or similar).
-        """
-        if not self.connected:
-            raise PicoScopeError("PicoScope not connected.")
-        # Try to find a software control function; if not, rely on shots=0 behavior
-        if hasattr(ps, "ps2000aSigGenSoftwareControl"):
-            status = ps.ps2000aSigGenSoftwareControl(self.chandle, ctypes.c_int16(1))
-            if status != 0:
-                raise PicoScopeError(f"ps2000aSigGenSoftwareControl(start) returned {status}")
-            self.log("PicoScope AWG software-start requested.")
-        else:
-            # Many SDKs start AWG immediately for shots=0; we'll log that.
-            self.log("PicoScope AWG: start_output() called (SDK may start AWG automatically after configuration).")
+        # ps2000 starts output immediately after set_waveform()
+        self.log("PicoScope AWG: start_output() called (output starts automatically).")
 
     def stop_output(self):
-        """Stop AWG output.
-
-        If your SDK provides a software control function use it; otherwise set amplitude to zero as fallback.
-        """
         if not self.connected:
             raise PicoScopeError("PicoScope not connected.")
-
-        if hasattr(ps, "ps2000aSigGenSoftwareControl"):
-            status = ps.ps2000aSigGenSoftwareControl(self.chandle, ctypes.c_int16(0))
-            if status != 0:
-                raise PicoScopeError(f"ps2000aSigGenSoftwareControl(stop) returned {status}")
-            self.log("PicoScope AWG software-stop requested.")
-        else:
-            # Fallback: reconfigure to 0 Vpp (soft stop)
-            try:
-                if self._last_cfg:
-                    cfg = self._last_cfg
-                    self.set_waveform(cfg["shape"], cfg["f_start"], cfg["f_stop"],
-                                      vpp=0.0, offset=cfg["offset"],
-                                      increment=cfg["increment"], dwell_time=cfg["dwell_time"])
-                    self.log("PicoScope AWG stopped (fallback: set Vpp=0).")
-                else:
-                    self.log("PicoScope AWG stop requested but no previous config known.")
-            except Exception as e:
-                raise PicoScopeError(f"Failed to stop AWG (fallback): {e}")
+        ps.ps2000_set_sig_gen_built_in(self.handle, 0, 0, 0, ctypes.c_double(0))
+        self.log("PicoScope AWG stopped (set amplitude to 0).")
 
 
 # --------------------------
@@ -257,7 +173,7 @@ class PicoScope2000:
 @dataclass
 class SIOSConfig:
     port: str = "COM4"
-    baudrate: int = 115200
+    baudrate: int = 9600
     timeout_s: float = 1.0
 
 
