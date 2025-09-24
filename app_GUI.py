@@ -28,7 +28,7 @@ except ImportError:
     picoEnum = None
     ctypes = None
 
-SAMPLES_DEFAULT = 2000
+SAMPLES_DEFAULT = 10000
 OVERSAMPLING_DEFAULT = 1
 
 # Robust waveform mapping. If ps provides enums use them; otherwise fall back to simple ints.
@@ -116,9 +116,9 @@ class PicoScope2000:
         # pick wave type numeric code
         wave = WAVE_TYPES.get(shape.upper(), WAVE_TYPES["SIN"]) if WAVE_TYPES else 0
 
-        # driver expects mV for pk-to-pk and offset in mV
-        pkToPk = int(round(vpp * 1000.0))
-        dcOffset = int(round(offset * 1000.0))
+        # driver expects µV for pk-to-pk and offset
+        pkToPk = int(round(vpp * 1_000_000.0))  # V -> µV
+        dcOffset = int(round(offset * 1_000_000.0))  # V -> µV
 
         fStop_safe = f_stop if (f_stop is not None) else f_start
         increment_safe = increment if (increment is not None) else 0.0
@@ -143,8 +143,9 @@ class PicoScope2000:
         # signature (wrapper): (int16 handle, int32 offsetVoltage, uint32 pkToPk, int32 waveType,
         #                         float startFrequency, float stopFrequency, float increment,
         #                         float dwellTime, int32 sweepType, uint32 sweeps)
+        # Try calling with ctypes params first, fall back to plain python types
         try:
-            fn(
+            res = fn(
                 ctypes.c_int16(self.handle),
                 ctypes.c_int32(dcOffset),
                 ctypes.c_uint32(pkToPk),
@@ -157,9 +158,9 @@ class PicoScope2000:
                 ctypes.c_uint32(int(sweeps)),
             )
         except TypeError:
-            # Some wrapper variants expose the handle as a plain int param in Python; try that
-            fn(
-                self.handle,
+            # fallback to plain ints/floats
+            res = fn(
+                int(self.handle),
                 int(dcOffset),
                 int(pkToPk),
                 int(wave),
@@ -170,6 +171,9 @@ class PicoScope2000:
                 int(sweep_type),
                 int(sweeps),
             )
+
+        return res
+
         self.log("PicoScope2000: waveform configured")
 
     def start_output(self):
@@ -206,90 +210,87 @@ class PicoScope2000:
         self.output_on = False
         self.log("PicoScope2000: output stopped (set to DC 0V)")
 
-    def read_channel_b(self, n_samples=SAMPLES_DEFAULT, wanted_time_interval=4000):
-        """Capture Channel B waveform using run_block + get_times_and_values."""
+    def read_channel_b(self, f_target=1000.0, cycles=10, points_per_cycle=100):
+        """Capture Channel B and auto-scale timebase based on AWG frequency."""
         if not self.connected or self.handle is None:
             raise PicoScopeError("Device not connected")
 
-        # Enable Channel B
+        n_samples = int(cycles * points_per_cycle)
+        wanted_time_interval = 1.0 / (f_target * points_per_cycle)  # seconds per sample
+
+        # Enable Channel B (10 V range, DC coupling)
         res = ps2000.ps2000_set_channel(
             self.handle,
-            picoEnum.PICO_CHANNEL['PICO_CHANNEL_B'],
+            picoEnum.PICO_CHANNEL["PICO_CHANNEL_B"],
             True,
-            picoEnum.PICO_COUPLING['PICO_DC'],
-            ps2000.PS2000_VOLTAGE_RANGE['PS2000_50MV'],
+            picoEnum.PICO_COUPLING["PICO_DC"],
+            ps2000.PS2000_VOLTAGE_RANGE["PS2000_10V"],
         )
         assert_pico2000_ok(res)
 
-        # Determine suitable timebase
-        current_timebase = 1
-        time_interval = c_int32(0)
+        # --- Find suitable timebase ---
+        time_interval = c_int32()
         time_units = c_int16()
         max_samples = c_int32()
-        old_interval = None
+        timebase = 1
 
-        while ps2000.ps2000_get_timebase(
+        while True:
+            ok = ps2000.ps2000_get_timebase(
                 self.handle,
-                current_timebase,
+                timebase,
                 n_samples,
                 byref(time_interval),
                 byref(time_units),
-                1,
-                byref(max_samples)
-        ) == 0 or time_interval.value < wanted_time_interval:
-            old_interval = time_interval.value
-            current_timebase += 1
-            if current_timebase.bit_length() > sizeof(c_int16) * 8:
-                raise PicoScopeError("No appropriate timebase found")
+                OVERSAMPLING_DEFAULT,
+                byref(max_samples),
+            )
+            if ok and time_interval.value >= wanted_time_interval * 1e9:  # ns
+                break
+            timebase += 1
+            if timebase > 20000:
+                raise PicoScopeError("No suitable timebase found")
 
-        timebase = current_timebase - 1
-
-        # Start block capture
+        # --- Run block capture ---
         collection_time = c_int32()
         res = ps2000.ps2000_run_block(
             self.handle,
             n_samples,
             timebase,
             OVERSAMPLING_DEFAULT,
-            byref(collection_time)
+            byref(collection_time),
         )
         assert_pico2000_ok(res)
 
-        # Wait until capture is complete
         while ps2000.ps2000_ready(self.handle) == 0:
             sleep(0.01)
 
-        # Allocate buffers
-        times = (c_int32 * n_samples)()
+        # --- Get samples ---
         buffer_b = (c_int16 * n_samples)()
         overflow = c_byte(0)
 
-        # Retrieve samples
-        res = ps2000.ps2000_get_times_and_values(
+        ps2000.ps2000_get_values(
             self.handle,
-            byref(times),
             None,
-            byref(buffer_b),
+            buffer_b,
             None,
             None,
             byref(overflow),
-            2,  # time units: ns
-            n_samples
+            n_samples,
         )
-        assert_pico2000_ok(res)
 
-        # Convert ADC → mV
+        # Convert ADC to volts
         channel_b_mv = adc2mV(
             buffer_b,
-            ps2000.PS2000_VOLTAGE_RANGE['PS2000_50MV'],
-            c_int16(32767)
+            ps2000.PS2000_VOLTAGE_RANGE["PS2000_10V"],
+            c_int16(32767),
         )
+        channel_b_v = [v / 1000.0 for v in channel_b_mv]
 
-        # Convert ctypes arrays to plain Python lists
-        times_ms = [t * 1e-6 for t in times]  # ns → ms
-        channel_b_mv = list(channel_b_mv)
+        # Build time axis (seconds)
+        dt = time_interval.value * 1e-9  # ns → s
+        times = [i * dt for i in range(n_samples)]
 
-        return times_ms, channel_b_mv, overflow.value
+        return times, channel_b_v, overflow.value
 
 # -------------------------
 # SIOS controller (unchanged)
@@ -468,7 +469,7 @@ class App(ttk.Frame):
         self.fig_b = Figure(figsize=(5, 3), dpi=100)
         self.ax_b = self.fig_b.add_subplot(111)
         self.ax_b.set_title("PicoScope Channel B")
-        self.ax_b.set_xlabel("Sample")
+        self.ax_b.set_xlabel("Time [s]")
         self.ax_b.set_ylabel("Voltage [V]")
         self.line_b, = self.ax_b.plot([], [], "-")
 
@@ -509,27 +510,50 @@ class App(ttk.Frame):
         if self.pico is None:
             self._log("Pico: picosdk not available")
             return
+
         def task():
             try:
+                shape = self.var_shape.get()
+                f_start = float(self.var_f_start.get())
+                f_stop = float(self.var_f_stop.get())
+                increment = float(self.var_increment.get())
+                dwell_time = float(self.var_dwell.get())
+                vpp = float(self.var_vpp.get())
+                offset = float(self.var_offset.get())
+                sweep_enabled = bool(self.var_sweep.get())
+                output = bool(self.var_output.get())
+
+                if not output:
+                    self.var_status.set("Pico: output OFF (checkbox not ticked)")
+                    self._log("AWG output disabled")
+                    return
+
                 self.var_status.set("Pico: applying configuration...")
-                self.pico.set_waveform(
-                    shape=self.var_shape.get(),
-                    f_start=self.var_f_start.get(),
-                    f_stop=self.var_f_stop.get(),
-                    increment=self.var_increment.get(),
-                    dwell_time=self.var_dwell.get(),
-                    vpp=self.var_vpp.get(),
-                    offset=self.var_offset.get(),
-                    sweep_enabled=self.var_sweep.get(),
+                self._log(
+                    f"AWG config: {shape}, f_start={f_start} Hz, "
+                    f"f_stop={f_stop} Hz, inc={increment} Hz, dwell={dwell_time} s, "
+                    f"Vpp={vpp} V, offset={offset} V, sweep={sweep_enabled}"
                 )
-                # If output checkbox is checked, also start output
-                if self.var_output.get():
-                    self.pico.start_output()
+
+                res = self.pico.set_waveform(
+                    shape=shape,
+                    f_start=f_start,
+                    f_stop=f_stop,
+                    increment=increment,
+                    dwell_time=dwell_time,
+                    vpp=vpp,
+                    offset=offset,
+                    sweep_enabled=sweep_enabled,
+                )
+
                 self.var_status.set("Pico: configuration applied")
-                self._log(f"PicoScope: Applied {self.var_shape.get()} {self.var_f_start.get()}Hz {self.var_vpp.get()}Vpp offset {self.var_offset.get()}")
+                self._log(f"AWG started, result={res}")
             except Exception as e:
-                self._log(f"Pico ERROR: {e}")
+                import traceback
+                self._log("AWG ERROR: " + str(e))
+                self._log(traceback.format_exc())
                 self.var_status.set("Pico: apply failed")
+
         threading.Thread(target=task, daemon=True).start()
 
     def _pico_toggle(self):
@@ -560,11 +584,12 @@ class App(ttk.Frame):
 
         def task():
             try:
-                times_ms, ch_b_mv, overflow = self.pico.read_channel_b(n_samples=1000)
-                # Store the data and times for plotting
+                f_target = float(self.var_f_start.get())
+                times, ch_b_v, overflow = self.pico.read_channel_b(f_target=f_target)
+
                 self.pico_data_b.clear()
-                self.pico_data_b.extend(ch_b_mv)
-                self.pico_data_b_times = times_ms
+                self.pico_data_b.extend(ch_b_v)
+                self.pico_data_b_times = times
                 self.pico_overflow = overflow
                 self._update_pico_plot()
             except Exception as e:
@@ -573,23 +598,17 @@ class App(ttk.Frame):
         threading.Thread(target=task, daemon=True).start()
 
     def _update_pico_plot(self):
-        # Convert deque to list for plotting
+        if not hasattr(self, "pico_data_b_times"):
+            return
+
         ydata = list(self.pico_data_b)
-        xdata = list(range(len(ydata)))
+        xdata = self.pico_data_b_times[:len(ydata)]
 
-        # Update existing line instead of clearing the axes
-        if hasattr(self, 'line_b') and self.line_b in self.ax_b.lines:
-            self.line_b.set_data(xdata, ydata)
-        else:
-            # If line doesn't exist yet, create it
-            self.line_b, = self.ax_b.plot(xdata, ydata, '-')
-
-        # Adjust the view limits
+        self.line_b.set_data(xdata, ydata)
         self.ax_b.relim()
         self.ax_b.autoscale_view()
-
-        # Refresh the canvas
         self.canvas_b.draw_idle()
+
 
     # ----------------- SIOS Tab -----------------
     def _build_sios_tab(self):
