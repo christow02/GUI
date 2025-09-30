@@ -8,6 +8,9 @@ import time
 from time import sleep
 from dataclasses import dataclass
 from typing import Optional
+import numpy as np
+from ctypes import (Structure, c_ushort, c_uint, c_ulong, c_ulonglong, c_ubyte,
+                    c_double, c_float, POINTER, byref, sizeof, cdll, c_bool, c_char_p)
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -107,43 +110,18 @@ class PicoScope2000:
         self.handle = None
         self.log("PicoScope2000: disconnected")
 
-    def set_waveform(self, shape="SIN", f_start=1000.0, f_stop=None,
-                     vpp=2.0, offset=0.0, increment=0.0, dwell_time=1.0,
-                     sweep_enabled=False):
+    def set_waveform(self, shape="SIN", f_start=1000.0, vpp=2.0, offset=0.0):
         if not self.connected or self.handle is None:
             raise PicoScopeError("Device not connected")
 
-        # pick wave type numeric code
-        wave = WAVE_TYPES.get(shape.upper(), WAVE_TYPES["SIN"]) if WAVE_TYPES else 0
-
-        # driver expects µV for pk-to-pk and offset
-        pkToPk = int(round(vpp * 1_000_000.0))  # V -> µV
-        dcOffset = int(round(offset * 1_000_000.0))  # V -> µV
-
-        fStop_safe = f_stop if (f_stop is not None) else f_start
-        increment_safe = increment if (increment is not None) else 0.0
-        dwell_safe = dwell_time if (dwell_time is not None) else 0.0
-
-        if sweep_enabled and fStop_safe > f_start and increment_safe > 0:
-            self.log(f"Configuring sweep {f_start} → {fStop_safe} Hz step {increment_safe}, dwell {dwell_safe}s")
-            sweep_type = SWEEP_UP
-            sweeps = 1
-        else:
-            fStop_safe = f_start
-            increment_safe = 0.0
-            dwell_safe = 0.0
-            sweep_type = 0
-            sweeps = 0
-            self.log(f"Configuring CW {shape} at {f_start} Hz, {vpp} Vpp, offset {offset} V")
+        wave = WAVE_TYPES.get(shape.upper(), WAVE_TYPES["SIN"])
+        pkToPk = int(round(vpp * 1_000_000.0))  # V → µV
+        dcOffset = int(round(offset * 1_000_000.0))  # V → µV
 
         fn = self._get_fn("_set_sig_gen_built_in", "ps2000_set_sig_gen_built_in")
         if fn is None:
-            raise PicoScopeError("set_sig_gen_built_in API not found in ps wrapper")
+            raise PicoScopeError("set_sig_gen_built_in API not found")
 
-        # signature (wrapper): (int16 handle, int32 offsetVoltage, uint32 pkToPk, int32 waveType,
-        #                         float startFrequency, float stopFrequency, float increment,
-        #                         float dwellTime, int32 sweepType, uint32 sweeps)
-        # Try calling with ctypes params first, fall back to plain python types
         try:
             res = fn(
                 ctypes.c_int16(self.handle),
@@ -151,30 +129,28 @@ class PicoScope2000:
                 ctypes.c_uint32(pkToPk),
                 ctypes.c_int32(int(wave)),
                 ctypes.c_float(float(f_start)),
-                ctypes.c_float(float(fStop_safe)),
-                ctypes.c_float(float(increment_safe)),
-                ctypes.c_float(float(dwell_safe)),
-                ctypes.c_int32(int(sweep_type)),
-                ctypes.c_uint32(int(sweeps)),
+                ctypes.c_float(float(f_start)),  # same as start
+                ctypes.c_float(0.0),
+                ctypes.c_float(0.0),
+                ctypes.c_int32(0),
+                ctypes.c_uint32(0),
             )
         except TypeError:
-            # fallback to plain ints/floats
             res = fn(
                 int(self.handle),
                 int(dcOffset),
                 int(pkToPk),
                 int(wave),
                 float(f_start),
-                float(fStop_safe),
-                float(increment_safe),
-                float(dwell_safe),
-                int(sweep_type),
-                int(sweeps),
+                float(f_start),
+                0.0,
+                0.0,
+                0,
+                0,
             )
 
+        self.log(f"Configured CW {shape} at {f_start} Hz, {vpp} Vpp, offset {offset} V")
         return res
-
-        self.log("PicoScope2000: waveform configured")
 
     def start_output(self):
         if not self.connected or self.handle is None:
@@ -434,31 +410,25 @@ class App(ttk.Frame):
 
         self.var_shape = tk.StringVar(value="SIN")
         self.var_f_start = tk.DoubleVar(value=1000.0)
-        self.var_f_stop = tk.DoubleVar(value=1000.0)
-        self.var_increment = tk.DoubleVar(value=0.0)
-        self.var_dwell = tk.DoubleVar(value=1.0)
         self.var_vpp = tk.DoubleVar(value=2.0)
         self.var_offset = tk.DoubleVar(value=0.0)
-        self.var_sweep = tk.BooleanVar(value=False)
         self.var_output = tk.BooleanVar(value=False)
 
         ttk.Label(frm, text="Waveform").grid(row=0, column=0)
-        ttk.Combobox(frm, textvariable=self.var_shape, values=list(WAVE_TYPES.keys()), width=8).grid(row=0, column=1)
-        ttk.Label(frm, text="f start [Hz]").grid(row=1, column=0)
-        ttk.Entry(frm, textvariable=self.var_f_start, width=10).grid(row=1, column=1)
-        ttk.Label(frm, text="f stop [Hz]").grid(row=2, column=0)
-        ttk.Entry(frm, textvariable=self.var_f_stop, width=10).grid(row=2, column=1)
-        ttk.Label(frm, text="Increment [Hz]").grid(row=3, column=0)
-        ttk.Entry(frm, textvariable=self.var_increment, width=10).grid(row=3, column=1)
-        ttk.Label(frm, text="Dwell [s]").grid(row=4, column=0)
-        ttk.Entry(frm, textvariable=self.var_dwell, width=10).grid(row=4, column=1)
-        ttk.Label(frm, text="Vpp [V]").grid(row=5, column=0)
-        ttk.Entry(frm, textvariable=self.var_vpp, width=10).grid(row=5, column=1)
-        ttk.Label(frm, text="Offset [V]").grid(row=6, column=0)
-        ttk.Entry(frm, textvariable=self.var_offset, width=10).grid(row=6, column=1)
+        ttk.Combobox(frm, textvariable=self.var_shape,
+                     values=list(WAVE_TYPES.keys()), width=8).grid(row=0, column=1)
 
-        ttk.Checkbutton(frm, text="Enable Sweep", variable=self.var_sweep).grid(row=7, column=0, columnspan=2, sticky="w")
-        ttk.Checkbutton(frm, text="Output ON", variable=self.var_output, command=self._pico_toggle).grid(row=8, column=0, columnspan=2, sticky="w")
+        ttk.Label(frm, text="Frequency [Hz]").grid(row=1, column=0)
+        ttk.Entry(frm, textvariable=self.var_f_start, width=10).grid(row=1, column=1)
+
+        ttk.Label(frm, text="Vpp [V]").grid(row=2, column=0)
+        ttk.Entry(frm, textvariable=self.var_vpp, width=10).grid(row=2, column=1)
+
+        ttk.Label(frm, text="Offset [V]").grid(row=3, column=0)
+        ttk.Entry(frm, textvariable=self.var_offset, width=10).grid(row=3, column=1)
+
+        ttk.Checkbutton(frm, text="Output ON", variable=self.var_output,
+                        command=self._pico_toggle).grid(row=4, column=0, columnspan=2, sticky="w")
 
         ttk.Button(frm, text="Connect", command=self._pico_connect).grid(row=9, column=0, padx=2, pady=4)
         ttk.Button(frm, text="Disconnect", command=self._pico_disconnect).grid(row=9, column=1, padx=2, pady=4)
@@ -471,6 +441,8 @@ class App(ttk.Frame):
         self.ax_b.set_title("PicoScope Channel B")
         self.ax_b.set_xlabel("Time [s]")
         self.ax_b.set_ylabel("Voltage [V]")
+        self.fig_b.subplots_adjust(left=0.17)
+        self.fig_b.subplots_adjust(bottom=0.2)
         self.line_b, = self.ax_b.plot([], [], "-")
 
         canvas_b = FigureCanvasTkAgg(self.fig_b, master=frm)
@@ -515,12 +487,8 @@ class App(ttk.Frame):
             try:
                 shape = self.var_shape.get()
                 f_start = float(self.var_f_start.get())
-                f_stop = float(self.var_f_stop.get())
-                increment = float(self.var_increment.get())
-                dwell_time = float(self.var_dwell.get())
                 vpp = float(self.var_vpp.get())
                 offset = float(self.var_offset.get())
-                sweep_enabled = bool(self.var_sweep.get())
                 output = bool(self.var_output.get())
 
                 if not output:
@@ -529,21 +497,13 @@ class App(ttk.Frame):
                     return
 
                 self.var_status.set("Pico: applying configuration...")
-                self._log(
-                    f"AWG config: {shape}, f_start={f_start} Hz, "
-                    f"f_stop={f_stop} Hz, inc={increment} Hz, dwell={dwell_time} s, "
-                    f"Vpp={vpp} V, offset={offset} V, sweep={sweep_enabled}"
-                )
+                self._log(f"AWG config: {shape}, f={f_start} Hz, Vpp={vpp} V, offset={offset} V")
 
                 res = self.pico.set_waveform(
                     shape=shape,
                     f_start=f_start,
-                    f_stop=f_stop,
-                    increment=increment,
-                    dwell_time=dwell_time,
                     vpp=vpp,
                     offset=offset,
-                    sweep_enabled=sweep_enabled,
                 )
 
                 self.var_status.set("Pico: configuration applied")
